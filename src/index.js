@@ -315,6 +315,10 @@ Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
 
   const parent = window;
   const iframe = document.createElement('iframe');
+  iframe.scrolling = 'no';
+  iframe.frameBorder = 0;
+  iframe.style.height = 0;
+  iframe.style.width = '100%';
 
   (appendTo || document.body).appendChild(iframe);
 
