@@ -10,18 +10,22 @@ const DATA_CLONE_ERROR = 'DataCloneError';
 export const ERR_CONNECTION_DESTROYED = 'ConnectionDestroyed';
 export const ERR_CONNECTION_TIMEOUT = 'ConnectionTimeout';
 export const ERR_NOT_IN_IFRAME = 'NotInIframe';
+export const ERR_IFRAME_ALREADY_ATTACHED_TO_DOM = 'IframeAlreadyAttachedToDom';
+
+const CHECK_IFRAME_IN_DOC_INTERVAL = 60000;
 
 const DEFAULT_PORTS = {
   'http:': '80',
   'https:': '443'
 };
 
-const URL_REGEX = /^(https?:)?\/\/([^\/:]+)(:(\d+))?/;
+const URL_REGEX = /^(https?:|file:)?\/\/([^/:]+)?(:(\d+))?/;
 
 const Penpal = {
   ERR_CONNECTION_DESTROYED,
   ERR_CONNECTION_TIMEOUT,
   ERR_NOT_IN_IFRAME,
+  ERR_IFRAME_ALREADY_ATTACHED_TO_DOM,
 
   /**
    * Promise implementation.
@@ -64,7 +68,7 @@ const log = (...args) => {
  * @param {string} url
  * @return {string} The URL's origin
  */
-const getOriginFromUrl = (url) => {
+const getOriginFromUrl = url => {
   const location = document.location;
 
   const regexResult = URL_REGEX.exec(url);
@@ -72,20 +76,30 @@ const getOriginFromUrl = (url) => {
   let hostname;
   let port;
 
-  if (regexResult) { // It's an absolute URL. Use the parsed info.
+  if (regexResult) {
+    // It's an absolute URL. Use the parsed info.
     // regexResult[1] will be undefined if the URL starts with //
     protocol = regexResult[1] ? regexResult[1] : location.protocol;
     hostname = regexResult[2];
     port = regexResult[4];
-  } else { // It's a relative path. Use the current location's info.
+  } else {
+    // It's a relative path. Use the current location's info.
     protocol = location.protocol;
     hostname = location.hostname;
     port = location.port;
   }
 
+  // If the protocol is file, the origin is "null"
+  // The origin of a document with file protocol is an opaque origin
+  // and its serialization "null" [1]
+  // [1] https://html.spec.whatwg.org/multipage/origin.html#origin
+  if (protocol === "file:") {
+    return "null";
+  }
+
   // If the port is the default for the protocol, we don't want to add it to the origin string
   // or it won't match the message's event.origin.
-  const portSuffix = (port && port !== DEFAULT_PORTS[protocol] ? `:${port}` : '');
+  const portSuffix = port && port !== DEFAULT_PORTS[protocol] ? `:${port}` : '';
   return `${protocol}//${hostname}${portSuffix}`;
 };
 
@@ -97,11 +111,11 @@ const getOriginFromUrl = (url) => {
  * @returns {Object}
  * @constructor
  */
-const DestructionPromise = (executor) => {
+const DestructionPromise = executor => {
   const handlers = [];
 
   executor(() => {
-    handlers.forEach((handler) => {
+    handlers.forEach(handler => {
       handler();
     });
   });
@@ -125,9 +139,9 @@ const serializeError = ({ name, message, stack }) => ({ name, message, stack });
  * @param {Object} Object with error properties.
  * @returns {Error}
  */
-const deserializeError = (obj) => {
+const deserializeError = obj => {
   const deserializedError = new Error();
-  Object.keys(obj).forEach(key => deserializedError[key] = obj[key]);
+  Object.keys(obj).forEach(key => (deserializedError[key] = obj[key]));
   return deserializedError;
 };
 
@@ -142,30 +156,49 @@ const deserializeError = (obj) => {
  * connection.
  * @returns {Object} The call sender object with methods that may be called.
  */
-const connectCallSender = (callSender, info, methodNames, destructionPromise) => {
+const connectCallSender = (
+  callSender,
+  info,
+  methodNames,
+  destroy,
+  destructionPromise
+) => {
   const { localName, local, remote, remoteOrigin } = info;
   let destroyed = false;
 
   log(`${localName}: Connecting call sender`);
 
-  const createMethodProxy = (methodName) => {
+  const createMethodProxy = methodName => {
     return (...args) => {
       log(`${localName}: Sending ${methodName}() call`);
 
+      // This handles the case where the iframe has been removed from the DOM
+      // (and therefore its window closed), the consumer has not yet
+      // called destroy(), and the user calls a method exposed by
+      // the remote. We detect the iframe has been removed and force
+      // a destroy() immediately so that the consumer sees the error saying
+      // the connection has been destroyed.
+      if (remote.closed) {
+        destroy();
+      }
+
       if (destroyed) {
-        const error = new Error(`Unable to send ${methodName}() call due ` +
-          `to destroyed connection`);
+        const error = new Error(
+          `Unable to send ${methodName}() call due ` + `to destroyed connection`
+        );
         error.code = ERR_CONNECTION_DESTROYED;
         throw error;
       }
 
       return new Penpal.Promise((resolve, reject) => {
         const id = generateId();
-        const handleMessageEvent = (event) => {
-          if (event.source === remote &&
-              event.origin === remoteOrigin &&
-              event.data.penpal === REPLY &&
-              event.data.id === id) {
+        const handleMessageEvent = event => {
+          if (
+            event.source === remote &&
+            event.origin === remoteOrigin &&
+            event.data.penpal === REPLY &&
+            event.data.id === id
+          ) {
             log(`${localName}: Received ${methodName}() reply`);
             local.removeEventListener(MESSAGE, handleMessageEvent);
 
@@ -175,17 +208,22 @@ const connectCallSender = (callSender, info, methodNames, destructionPromise) =>
               returnValue = deserializeError(returnValue);
             }
 
-            (event.data.resolution === FULFILLED ? resolve : reject)(returnValue);
+            (event.data.resolution === FULFILLED ? resolve : reject)(
+              returnValue
+            );
           }
         };
 
         local.addEventListener(MESSAGE, handleMessageEvent);
-        remote.postMessage({
-          penpal: CALL,
-          id,
-          methodName,
-          args
-        }, remoteOrigin);
+        remote.postMessage(
+          {
+            penpal: CALL,
+            id,
+            methodName,
+            args
+          },
+          remoteOrigin
+        );
       });
     };
   };
@@ -216,17 +254,19 @@ const connectCallReceiver = (info, methods, destructionPromise) => {
 
   log(`${localName}: Connecting call receiver`);
 
-  const handleMessageEvent = (event) => {
-    if (event.source === remote &&
-        event.origin === remoteOrigin &&
-        event.data.penpal === CALL) {
+  const handleMessageEvent = event => {
+    if (
+      event.source === remote &&
+      event.origin === remoteOrigin &&
+      event.data.penpal === CALL
+    ) {
       const { methodName, args, id } = event.data;
 
       log(`${localName}: Received ${methodName}() call`);
 
       if (methodName in methods) {
-        const createPromiseHandler = (resolution) => {
-          return (returnValue) => {
+        const createPromiseHandler = resolution => {
+          return returnValue => {
             log(`${localName}: Sending ${methodName}() reply`);
 
             if (destroyed) {
@@ -235,7 +275,9 @@ const connectCallReceiver = (info, methods, destructionPromise) => {
               // is merely returning a value from their method and not calling any function
               // that they could wrap in a try-catch. Even if the consumer were to catch the error,
               // the value of doing so is questionable. Instead, we'll just log a message.
-              log(`${localName}: Unable to send ${methodName}() reply due to destroyed connection`);
+              log(
+                `${localName}: Unable to send ${methodName}() reply due to destroyed connection`
+              );
               return;
             }
 
@@ -243,7 +285,7 @@ const connectCallReceiver = (info, methods, destructionPromise) => {
               penpal: REPLY,
               id,
               resolution,
-              returnValue,
+              returnValue
             };
 
             if (resolution === REJECTED && returnValue instanceof Error) {
@@ -257,13 +299,16 @@ const connectCallReceiver = (info, methods, destructionPromise) => {
               // If a consumer attempts to send an object that's not cloneable (e.g., window),
               // we want to ensure the receiver's promise gets rejected.
               if (err.name === DATA_CLONE_ERROR) {
-                remote.postMessage({
-                  penpal: REPLY,
-                  id,
-                  resolution: REJECTED,
-                  returnValue: serializeError(err),
-                  returnValueIsError: true
-                }, remoteOrigin);
+                remote.postMessage(
+                  {
+                    penpal: REPLY,
+                    id,
+                    resolution: REJECTED,
+                    returnValue: serializeError(err),
+                    returnValueIsError: true
+                  },
+                  remoteOrigin
+                );
               }
 
               throw err;
@@ -271,8 +316,9 @@ const connectCallReceiver = (info, methods, destructionPromise) => {
           };
         };
 
-        new Penpal.Promise(resolve => resolve(methods[methodName].apply(methods, args)))
-          .then(createPromiseHandler(FULFILLED), createPromiseHandler(REJECTED));
+        new Penpal.Promise(resolve =>
+          resolve(methods[methodName].apply(methods, args))
+        ).then(createPromiseHandler(FULFILLED), createPromiseHandler(REJECTED));
       }
     }
   };
@@ -299,16 +345,25 @@ const connectCallReceiver = (info, methods, destructionPromise) => {
  * the iframe.
  * @param {Object} options
  * @param {string} options.url The URL of the webpage that should be loaded into the created iframe.
- * @param {HTMLElement} [options.appendTo] The container to which the iframe should be appended.
+ * @param {HTMLElement} [options.appendTo] The node reference to which the iframe should be appended before.
  * @param {Object} [options.methods={}] Methods that may be called by the iframe.
  * @param {Number} [options.timeout] The amount of time, in milliseconds, Penpal should wait
  * for the child to respond before rejecting the connection promise.
  * @return {Child}
  */
-Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
+Penpal.connectToChild = ({ url, appendTo, iframe, methods = {}, timeout }) => {
+  if (iframe && iframe.parentNode) {
+    const error = new Error(
+      'connectToChild() must not be called with an iframe already attached to DOM'
+    );
+    error.code = ERR_IFRAME_ALREADY_ATTACHED_TO_DOM;
+    throw error;
+  }
+
   let destroy;
+
   const connectionDestructionPromise = new DestructionPromise(
-    (resolveConnectionDestructionPromise) => {
+    resolveConnectionDestructionPromise => {
       destroy = resolveConnectionDestructionPromise;
     }
   );
@@ -320,22 +375,15 @@ Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
   iframe.style.height = 0;
   iframe.style.width = '100%';
 
-  (appendTo || document.body).appendChild(iframe);
-
-  connectionDestructionPromise.then(() => {
-    if (iframe.parentNode) {
-      iframe.parentNode.removeChild(iframe);
-    }
-  });
-
-  const child = iframe.contentWindow || iframe.contentDocument.parentWindow;
   const childOrigin = getOriginFromUrl(url);
   const promise = new Penpal.Promise((resolveConnectionPromise, reject) => {
     let connectionTimeoutId;
 
     if (timeout !== undefined) {
       connectionTimeoutId = setTimeout(() => {
-        const error = new Error(`Connection to child timed out after ${timeout}ms`);
+        const error = new Error(
+          `Connection to child timed out after ${timeout}ms`
+        );
         error.code = ERR_CONNECTION_TIMEOUT;
         reject(error);
         destroy();
@@ -350,22 +398,33 @@ Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
 
     let destroyCallReceiver;
 
-    const handleMessage = (event) => {
-      if (event.source === child &&
-          event.origin === childOrigin &&
-          event.data.penpal === HANDSHAKE) {
+    const handleMessage = event => {
+      const child = iframe.contentWindow;
+      if (
+        event.source === child &&
+        event.origin === childOrigin &&
+        event.data.penpal === HANDSHAKE
+      ) {
         log('Parent: Received handshake, sending reply');
 
-        event.source.postMessage({
-          penpal: HANDSHAKE_REPLY,
-          methodNames: Object.keys(methods)
-        }, event.origin);
+        // If event.origin is "null", the remote protocol is file:
+        // and we must post messages with "*" as targetOrigin [1]
+        // [1] https://developer.mozilla.org/fr/docs/Web/API/Window/postMessage#Utiliser_window.postMessage_dans_les_extensions
+        const remoteOrigin = event.origin === "null" ? "*" : event.origin;
+
+        event.source.postMessage(
+          {
+            penpal: HANDSHAKE_REPLY,
+            methodNames: Object.keys(methods)
+          },
+          remoteOrigin
+        );
 
         const info = {
           localName: 'Parent',
           local: parent,
           remote: child,
-          remoteOrigin: event.origin
+          remoteOrigin: remoteOrigin
         };
 
         // If the child reconnected, we need to destroy the previous call receiver before setting
@@ -377,8 +436,10 @@ Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
         // When this promise is resolved, it will destroy the call receiver (stop listening to
         // method calls from the child) and delete its methods off the call sender.
         const callReceiverDestructionPromise = new DestructionPromise(
-          (resolveCallReceiverDestructionPromise) => {
-            connectionDestructionPromise.then(resolveCallReceiverDestructionPromise);
+          resolveCallReceiverDestructionPromise => {
+            connectionDestructionPromise.then(
+              resolveCallReceiverDestructionPromise
+            );
             destroyCallReceiver = resolveCallReceiverDestructionPromise;
           }
         );
@@ -388,29 +449,54 @@ Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
         // If the child reconnected, we need to remove the methods from the previous call receiver
         // off the sender.
         if (receiverMethodNames) {
-          receiverMethodNames.forEach((receiverMethodName) => {
+          receiverMethodNames.forEach(receiverMethodName => {
             delete callSender[receiverMethodName];
           });
         }
 
         receiverMethodNames = event.data.methodNames;
-        connectCallSender(callSender, info, receiverMethodNames, connectionDestructionPromise);
+        connectCallSender(
+          callSender,
+          info,
+          receiverMethodNames,
+          destroy,
+          connectionDestructionPromise
+        );
         clearTimeout(connectionTimeoutId);
         resolveConnectionPromise(callSender);
       }
     };
 
     parent.addEventListener(MESSAGE, handleMessage);
+
+    log('Parent: Loading iframe');
+    appendTo.parentNode.insertBefore(iframe, appendTo);
+
+    // This is to prevent memory leaks when the iframe is removed
+    // from the document and the consumer hasn't called destroy().
+    // Without this, event listeners attached to the window would
+    // stick around and since the event handlers have a reference
+    // to the iframe in their closures, the iframe would stick around
+    // too.
+    var checkIframeInDocIntervalId = setInterval(() => {
+      if (!document.contains(iframe)) {
+        clearInterval(checkIframeInDocIntervalId);
+        destroy();
+      }
+    }, CHECK_IFRAME_IN_DOC_INTERVAL);
+
     connectionDestructionPromise.then(() => {
+      if (iframe.parentNode) {
+        iframe.parentNode.removeChild(iframe);
+      }
+
       parent.removeEventListener(MESSAGE, handleMessage);
+      clearInterval(checkIframeInDocIntervalId);
 
       const error = new Error('Connection destroyed');
       error.code = ERR_CONNECTION_DESTROYED;
       reject(error);
     });
-
-    log('Parent: Loading iframe');
-    iframe.src = url;
   });
 
   return {
@@ -435,16 +521,22 @@ Penpal.connectToChild = ({ url, appendTo, methods = {}, timeout }) => {
  * for the parent to respond before rejecting the connection promise.
  * @return {Parent}
  */
-Penpal.connectToParent = ({ parentOrigin = '*', methods = {}, timeout } = {}) => {
+Penpal.connectToParent = ({
+  parentOrigin = '*',
+  methods = {},
+  timeout
+} = {}) => {
   if (window === window.top) {
-    const error = new Error('connectToParent() must be called within an iframe');
+    const error = new Error(
+      'connectToParent() must be called within an iframe'
+    );
     error.code = ERR_NOT_IN_IFRAME;
     throw error;
   }
 
   let destroy;
   const connectionDestructionPromise = new DestructionPromise(
-    (resolveConnectionDestructionPromise) => {
+    resolveConnectionDestructionPromise => {
       destroy = resolveConnectionDestructionPromise;
     }
   );
@@ -457,18 +549,21 @@ Penpal.connectToParent = ({ parentOrigin = '*', methods = {}, timeout } = {}) =>
 
     if (timeout !== undefined) {
       connectionTimeoutId = setTimeout(() => {
-        const error = new Error(`Connection to parent timed out after ${timeout}ms`);
+        const error = new Error(
+          `Connection to parent timed out after ${timeout}ms`
+        );
         error.code = ERR_CONNECTION_TIMEOUT;
         reject(error);
         destroy();
       }, timeout);
     }
 
-    const handleMessageEvent = (event) => {
-      if ((parentOrigin === '*' ||
-          parentOrigin === event.origin) &&
-          event.source === parent &&
-          event.data.penpal === HANDSHAKE_REPLY) {
+    const handleMessageEvent = event => {
+      if (
+        (parentOrigin === '*' || parentOrigin === event.origin) &&
+        event.source === parent &&
+        event.data.penpal === HANDSHAKE_REPLY
+      ) {
         log('Child: Received handshake reply');
 
         child.removeEventListener(MESSAGE, handleMessageEvent);
@@ -483,7 +578,13 @@ Penpal.connectToParent = ({ parentOrigin = '*', methods = {}, timeout } = {}) =>
         const callSender = {};
 
         connectCallReceiver(info, methods, connectionDestructionPromise);
-        connectCallSender(callSender, info, event.data.methodNames, connectionDestructionPromise)
+        connectCallSender(
+          callSender,
+          info,
+          event.data.methodNames,
+          destroy,
+          connectionDestructionPromise
+        );
         clearTimeout(connectionTimeoutId);
         resolveConnectionPromise(callSender);
       }
@@ -501,10 +602,13 @@ Penpal.connectToParent = ({ parentOrigin = '*', methods = {}, timeout } = {}) =>
 
     log('Child: Sending handshake');
 
-    parent.postMessage({
-      penpal: HANDSHAKE,
-      methodNames: Object.keys(methods),
-    }, parentOrigin);
+    parent.postMessage(
+      {
+        penpal: HANDSHAKE,
+        methodNames: Object.keys(methods)
+      },
+      parentOrigin
+    );
   });
 
   return {
