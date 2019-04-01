@@ -50,7 +50,7 @@ const Penpal = {
  */
 const generateId = (() => {
   let id = 0;
-  return () => ++id;
+  return () => `iDalgoIframe-${++id}`;
 })();
 
 /**
@@ -369,11 +369,13 @@ Penpal.connectToChild = ({ url, appendTo, iframe, methods = {}, timeout }) => {
   );
 
   const parent = window;
-  const iframe = document.createElement('iframe');
+  iframe = iframe || document.createElement('iframe');
+  iframe.src = url;
   iframe.scrolling = 'no';
   iframe.frameBorder = 0;
   iframe.style.height = 0;
-  iframe.style.width = '100%';
+  iframe.style.width = '100%'
+  iframe.style.maxWidth = '100vw !important';
 
   const childOrigin = getOriginFromUrl(url);
   const promise = new Penpal.Promise((resolveConnectionPromise, reject) => {
